@@ -10,6 +10,7 @@ use Encode;
 use Devel::SimpleTrace;
 use UUID::Tiny ':std';
 use Net::IP;
+use Socket;
 
 # default, will be overridden by ioctl if supported
 my $maxctrl = 4096;
@@ -29,6 +30,9 @@ my $tid = 1;		# transaction id
 # sleep and read all rcvd messages?
 my $monitor = 0;
 
+# use mbim-proxy
+my $proxy = 0;
+
 # management device
 my $mgmt = &strip_quotes($ENV{MGMT}) || "/dev/cdc-wdm0";
 
@@ -44,6 +48,7 @@ Usage: $0 [options]  open|caps|pin|close|connect|disconnect|attach|detach|getreg
 
 Where [options] are
 
+  --proxy
   --device=<cdc-wdm> (defaults to $mgmt)
   --pin=<code>
   --apn=<apn>
@@ -83,6 +88,7 @@ sub strip_quotes {
 
 ## let command line override defaults
 GetOptions(
+    'proxy!' => \$proxy,
     'device=s' => \$mgmt,
     'pin=s' => \$pin{1},
     'apn=s' => \$apn,
@@ -279,6 +285,8 @@ my %uuid = (
     UUID_INTEL_USB_PROFILE => 'fa142322-166b-4fd9-89f0-99be90ae8e3d',
     UUID_INTEL_CIQ         => '6a2a8150-abca-4b11-a4e2-f2fc879f5481',
 
+    # libmbim specific mbim-proxy
+    UUID_PROXY_CONTROL     => '838cf7fb-8d0d-4d7f-871e-d71dbefbb39b',
     );
 
 sub uuid_to_service {
@@ -393,6 +401,9 @@ my %cid = (
     'MBIM_CID_INTC_NRTCWS'                 =>  { 'service' => 'INTEL_NRTC',   'cid' => 2, },
     'MBIM_CID_INTC_USBPROFILE'             =>  { 'service' => 'INTEL_USBPROFILE', 'cid' => 1, },
     'MBIM_CID_INTC_CIQ'                    =>  { 'service' => 'INTEL_CIQ',    'cid' => 1, },
+
+    'MBIM_CID_PROXY_CONFIGURATION'         =>  { 'service' => 'PROXY_CONTROL',    'cid' => 1, },
+
     );
 
 sub cid_to_string {
@@ -667,6 +678,7 @@ sub mk_cid_pin {
 
     return &mk_command_msg('BASIC_CONNECT', 4, 1, $data);
 }
+
 
 # Table 10‐7: MBIM_DEVICE_TYPE 
 my %devicetype = (
@@ -1178,11 +1190,13 @@ sub decode_phonebook {
 	print "PHONEBOOK CID $cid decoding is not yet supported\n";
     }
 }
+
 sub decode_stk {
     my ($cid, $info) = @_;
 
     print "STK CID $cid decoding is not yet supported\n";
 }
+
 sub decode_auth {
     my ($cid, $info) = @_;
 
@@ -1598,6 +1612,18 @@ sub decode_basic_connect_extentions {
     }
 }
 
+sub decode_proxy_control {
+    my ($cid, $info) = @_;
+
+    if ($cid == 1) { # MBIM_CID_PROXY_CONFIGURATION
+	my ($off, $len, $timeout)  = unpack("V3", $info);
+	print "  DevicePath:\t", &utf16_field($info, $off, $len), "\n";
+	print "  Timeout:\t$timeout\n";  
+    } else {
+	print "PROXY_CONTROL CID $cid decoding is not yet supported\n";
+    }
+}
+
 
 my %decoder = (
     "BASIC_CONNECT" => \&decode_basic_connect,
@@ -1613,6 +1639,8 @@ my %decoder = (
 
     "MSFWID" => \&decode_msfwid,
     "BASIC_CONNECT_EXTENSIONS" => \&decode_basic_connect_extentions,
+
+    "PROXY_CONTROL" => \&decode_proxy_control,
     );
 
 my %frag;
@@ -1733,7 +1761,13 @@ sub read_mbim {
 	    my $len = 0;
 	    if ($len < 3 || $len < $msglen) {
 		my $tmp;
-		my $n = sysread(F, $tmp, $maxctrl);
+		my $n;
+		if ($proxy) {
+		    recv(F, $tmp, $maxctrl, 0);
+		    $n = length($tmp);
+		} else {
+		    $n = sysread(F, $tmp, $maxctrl);
+		}
 		if ($n) {
 		    $len = $n;
 		    $raw = $tmp;
@@ -1860,6 +1894,15 @@ sub mk_qmi {
     }
 }  
 
+sub send_mbim_msg {
+    my $msg = shift;
+    if ($proxy) {
+	send(F, $msg, 0) || die "foo";
+    } else {
+	print F $msg;
+    }
+}
+
 ### main ###
 
 # get the command
@@ -1873,8 +1916,19 @@ if ($cmd eq "offline") {
 }
 
 # open it now and keep it open until exit
-open(F, "+<", $mgmt) || die "open $mgmt: $!\n";
-autoflush F 1;
+if ($proxy) {
+    my $addr = sockaddr_un("\x{0}mbim-proxy");
+    socket(F, PF_UNIX, SOCK_STREAM, 0) || die "socket: $!\n";
+    connect(F, $addr) || die "connect: $!\n";
+    my $data = pack("V3", 12, 2*length($mgmt), 30) . encode('utf16le', "$mgmt\0");;
+    &send_mbim_msg(&mk_command_msg('PROXY_CONTROL', 1, 1, $data));
+##    my $ret = send_and_recv($req);
+##    warn "mbim-proxy open status=" . verify_status($ret) . "\n" if $verbose;
+##    die "mbim-proxy for $mgmt failed\n" if (verify_status($ret) != 0);
+} else {
+    open(F, "+<", $mgmt) || die "open $mgmt: $!\n";
+    autoflush F 1;
+}
 
 # check message size
 require 'sys/ioctl.ph';
@@ -1888,57 +1942,56 @@ if ($r) {
 }
 print "MaxMessageSize=$maxctrl\n"  if $debug;
 
-
 if ($cmd eq "open") {
-    print F &mk_open_msg;
+    &send_mbim_msg(&mk_open_msg);
 } elsif ($cmd eq "caps") {
-    print F &mk_cid_device_caps;
+    &send_mbim_msg(&mk_cid_device_caps);
 } elsif ($cmd eq "close") {
-    print F &mk_close_msg;
+    &send_mbim_msg(&mk_close_msg);
 } elsif ($cmd eq "pin") {
-    print F &mk_cid_pin($pin{1}) if $pin{1};
+    &send_mbim_msg(&mk_cid_pin($pin{1})) if $pin{1};
 } elsif ($cmd eq "connect") {
-    print F &mk_cid_connect($apn, 1, $session, @ARGV);
+    &send_mbim_msg(&mk_cid_connect($apn, 1, $session, @ARGV));
 } elsif ($cmd eq "ipv6") {
-    print F &mk_cid_connect($apn, 1, $session, 2, 'Internet');
+    &send_mbim_msg(&mk_cid_connect($apn, 1, $session, 2, 'Internet'));
 } elsif ($cmd eq "ipv4v6") {
-    print F &mk_cid_connect($apn, 1, $session, 3, 'Internet');
+    &send_mbim_msg(&mk_cid_connect($apn, 1, $session, 3, 'Internet'));
 } elsif ($cmd eq "mms") {
-    print F &mk_cid_connect($apn, 1, $session, 1, 'MMS');
+    &send_mbim_msg(&mk_cid_connect($apn, 1, $session, 1, 'MMS'));
 } elsif ($cmd eq "disconnect") {
-    print F &mk_cid_connect('', 0, $session);
+    &send_mbim_msg(&mk_cid_connect('', 0, $session));
 } elsif ($cmd eq "attach") {
-    print F &mk_cid_packet_service(1);
+    &send_mbim_msg(&mk_cid_packet_service(1));
 } elsif ($cmd eq "detach") {
-    print F &mk_cid_packet_service(0);
+    &send_mbim_msg(&mk_cid_packet_service(0));
 } elsif ($cmd eq "getreg") {
-    print F &mk_cid_register_state();
+    &send_mbim_msg(&mk_cid_register_state());
 } elsif ($cmd eq "getradiostate") {
-    print F &mk_cid_radio_state;
+    &send_mbim_msg(&mk_cid_radio_state);
 } elsif ($cmd eq "setradiostate") {
-    print F &mk_cid_radio_state(1);
+    &send_mbim_msg(&mk_cid_radio_state(1));
 } elsif ($cmd eq "getservices") {
-    print F &mk_command_msg('BASIC_CONNECT', 16, 0, '');
+    &send_mbim_msg(&mk_command_msg('BASIC_CONNECT', 16, 0, ''));
 } elsif ($cmd eq "getip") {
-    print F &mk_command_msg('BASIC_CONNECT', 15, 0, pack("V15",  $session, 0 x 14));
+    &send_mbim_msg(&mk_command_msg('BASIC_CONNECT', 15, 0, pack("V15",  $session, 0 x 14)));
 } elsif ($cmd eq "dssconnect") {
-    print F &mk_cid_dss_connect(shift, 1, $session);
+    &send_mbim_msg(&mk_cid_dss_connect(shift, 1, $session));
 } elsif ($cmd eq "dssdisconnect") {
-    print F &mk_cid_dss_connect(shift, 0, $session);
+    &send_mbim_msg(&mk_cid_dss_connect(shift, 0, $session));
 } elsif ($cmd eq "monitor") {
     &read_mbim;
 } elsif ($cmd eq "qmi") {
     if (defined($qmisys)) {
-	print F &mk_command_msg('EXT_QMUX', 1, 1, &mk_qmi($qmisys, $qmicid, @ARGV));
+	&send_mbim_msg(&mk_command_msg('EXT_QMUX', 1, 1, &mk_qmi($qmisys, $qmicid, @ARGV)));
     } else {
-	print F &mk_command_msg('EXT_QMUX', 1, 1, pack("C*", map { hex } @ARGV));
+	&send_mbim_msg(&mk_command_msg('EXT_QMUX', 1, 1, pack("C*", map { hex } @ARGV)));
     }
 } elsif ($cmd eq "qmiver") {
-    print F &mk_command_msg('EXT_QMUX', 1, 1, $qmiver);
+    &send_mbim_msg(&mk_command_msg('EXT_QMUX', 1, 1, $qmiver));
 } elsif ($cmd eq "unknown") {
-    print F &mk_command_msg(shift, shift, 1, pack("C*", map { hex } @ARGV));
+    &send_mbim_msg(&mk_command_msg(shift, shift, 1, pack("C*", map { hex } @ARGV)));
 } elsif ($cmd eq "getunknown") {
-    print F &mk_command_msg(shift, shift, 0, pack("C*", map { hex } @ARGV));
+    &send_mbim_msg(&mk_command_msg(shift, shift, 0, pack("C*", map { hex } @ARGV)));
 } else {
     &usage;
 }
@@ -2051,22 +2104,23 @@ sub decodesms {
             my $b7len= int(($udl*7)/8)+1;
             my $ud= substr($data, $ofs, $b7len);
             $ofs += $b7len;
-	    my $dcode = substr(sms7to8bit($ud),0,$udl*2);
+	    my $dcode = sms7to8bit($ud);
             printf("msg: '%s'\n", $dcode);
 	    $dcode =~ tr/\@//d;
-	    printf("msg: '%s'\n", decode('utf8', $dcode)) ;
+#	    printf("msg (7bit): '%s'\n", decode('utf8', $dcode)) ;
+	    printf("msg (7bit): '%s'\n", $dcode) ;
         }
         elsif (($dcs&0x0c)==0x04) {
             # 8 bit data
             my $ud= substr($data, $ofs, $udl);
             $ofs += ($udl*7)/8;
-            printf("msg: '%s'\n", $ud);
+            printf("msg (8bit): '%s'\n", $ud);
         }
         elsif (($dcs&0x0c)==0x08) {
             # ucs2 data
             my $ud= substr($data, $ofs, $udl);
             $ofs += $udl;
-            printf("msg: U'%s'\n", pack("U*", unpack("n*",$ud)));
+            printf("msg (ucs2): U'%s'\n", pack("U*", unpack("n*",$ud)));
         }
         # 0x91
         # 0xd0
@@ -2085,16 +2139,15 @@ sub decode_address {
     return sprintf("%d.%s.%s:%s", $one, $numtypes[$type], $plantypes[$plan], decodenumber($addr, $type))
 }
 sub sms7to8bit {
-my @xlat= (
-"@", "Â£", "\$", "Â¥", "eÌ€", "eÌ", "uÌ€", "iÌ€", "oÌ€", "CÌ§", "\n", "Ã˜", "Ã¸", "\r", "AÌŠ", "aÌŠ",
-"âˆ†", "_", "Î¦", "Î“", "Î›", "Î©", "Î ", "Î¨", "Î£", "Î˜", "Îž", "\x1b", "Ã†", "Ã¦", "ÃŸ", "EÌ", 
-"\x20", "!", "\x22", "#", "Â¤", "%", "&", "\x27", "(", ")", "*", "+", ",", "-", ".", "/",
+    my @xlat= (
+"@", "£", "\$", "¥", "è", "é", "ù", "ì", "ò", "Ç", "\n", "Ø", "ø", "\r", "Å", "å",
+"∆", "_", "Φ", "Γ", "Λ", "Ω", "Π", "Ψ", "Σ", "Θ", "Ξ", "\x1b", "Æ", "æ", "ß", "É", 
+"\x20", "!", "\x22", "#", "¤", "%", "&", "\x27", "(", ")", "*", "+", ",", "-", ".", "/",
 "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";", "<", "=", ">", "?",
-"Â¡", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
-"P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AÌˆ", "OÌˆ", "NÌƒ", "UÌˆ", "Â§",
-"Â¿", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
-"p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "aÌˆ", "oÌˆ", "nÌƒ", "uÌˆ", "a",
-
+"¡", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+"P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "Ä", "Ö", "Ñ", "Ü", "§",
+"¿", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
+"p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "ä", "ö", "ñ", "ü", "à",
 );
 my @xlat2= (
 " ", " ", " ", " ", " ", " ", " ", " ", " ", " ", "\x03", " ", " ", " ", " ", " ",
@@ -2110,8 +2163,10 @@ my @xlat2= (
 my $esc;
 #    printf("xx-%s\n", unpack("H*", $_[0]));
     my $bits= unpack("b*", $_[0]);
+    my @bytes = map { pack("b*", $_) } (split /(\d{7})/, $bits);
+#    print "num=", $#bytes, " ", unpack("C*", join('',@bytes)),"\n";
 #    if (length($bits)%7) { $bits=substr($bits, 0, -(length($bits)%7)); }
-    return join "", map { if ($esc) { $esc--; $xlat2[ord($_)] } elsif ($_ eq "\x1b") { $esc++ } else { $xlat[ord($_)] } } map { pack("b*", $_) } split /(\d{7})/, $bits;
+    return join "", map { if ($esc) { $esc--; $xlat2[ord($_)] } elsif ($_ eq "\x1b") { $esc++; '' } else { $xlat[ord($_)] } } @bytes;
 }
 sub decodenumber {
     my ($numdata, $type)= @_;
