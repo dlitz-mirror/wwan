@@ -8,7 +8,7 @@ use warnings;
 use Archive::Zip;
 use Getopt::Long;
 
-my $prod = "9X30";
+my $prod = "9X30"; # "9X50";
 my $fname = "BJORN";
 my $imgver = "00.00.00.00";  # match any?
 
@@ -18,6 +18,9 @@ my $ver = "INTERNAL_9901234_SWI${prod}C_${imgver}_00_${fname}_000.000_000";
 ##my $usbcomp = 0x0000050d; # (diag,nmea,modem,rmnet0,rmnet1) 
 ##my $usbcomp = 0x0000050f; # (diag,adb,nmea,modem,rmnet0,rmnet1)
 my $usbcomp = 0x0000100f; # (diag,adb,nmea,modem,mbim)
+my $pidapp  = 0x9071;
+my $pidboot = 0x9070;
+
 
 # Yeeha!  after adding
 #
@@ -136,23 +139,36 @@ sub mkcwehdr {
     return $reserved . pack("NNA4A4A4NNa84a8Na16N", $crc, 3, $val, $type, $prod, $imgsz, $imgcrc, $version, $date, $compat, '', $xxx) . $image;
 }
 
+sub mkentry {
+    my ($name, $type, @val) = @_;
+    my $len = 0;
+
+    $len = 8 if ($type eq 'VV');
+    $len = 4 if ($type eq 'vv');
+    $len = 1 if ($type eq 'C');
+    die "unsupported type '$type'" unless $len;
+    
+    my $valtlv = pack("vV$type", 2, $len, @val); # type=2, len=8, data = 0x0000001, $usbcomp
+    my $keytlv = pack("vVCa*", 1, length($name) + 1, 8, $name);
+    $len = 8 + length($keytlv) +  length($valtlv);
+    return pack("Vvv", $len, 1, 1).  # typical values
+	$keytlv . $valtlv;
+}
+
 # start from the back: value TLV, name TLV, NVUP entry, NVUP header, 
 sub mknvup {
-    my $valtlv = pack("vVVV", 2, 8, 1, $usbcomp); # type=2, len=8, data = 0x0000001, $usbcomp
-    my $name = "USB_COMP";
-    my $keytlv = pack("vVCa*", 1, length($name) + 1, 8, $name);
-    my $len = 8 + length($keytlv) +  length($valtlv);
-    my $entry = pack("Vvv", $len, 1, 1);  # typical values
-
     # header ($ver, $count, $foo, $bar)
-    return pack("vvvV", 1, 1, 1, 1).  # typical values, except for count which is fixed at 1 here
-	$entry . $keytlv . $valtlv;
+    return pack("vvvV", 1, 2, 1, 1).  # typical values, except for count which is fixed at 1 here
+	&mkentry("USB_COMP", 'VV', 1, $usbcomp).
+	&mkentry("USB_APP_BOOT_PIDS", 'vv', $pidapp, $pidboot);#.
+#	&mkentry("FCC_AUTH", 'C', 0);
 }
+
 
 
 my $image = &mknvup();
 my $cwe = &mkcwehdr('NVUP', $ver, 0x00000001, 0x50617273, $image);
-$cwe = &mkcwehdr('FILE', "/nvup/NVUP_${fname}.020", 0x01000000, 0x00000001, $cwe);
+$cwe = &mkcwehdr('FILE', "/nvup/NVUP_${fname}.022", 0x01000000, 0x00000001, $cwe);
 $cwe = &mkcwehdr('FILE', $ver, 0x00000000, 0x00000001, $cwe);
 $cwe = &mkcwehdr('SPKG', $ver, 0x00000000, 0x00000001, $cwe);
 print $cwe;
